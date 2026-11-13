@@ -1,0 +1,10 @@
+{
+  "transactionId": "e4b1a8d0-25c7-4b91-88fc-430b2ad01f41",
+  "amount": 24.50,
+  "status": "reversed",
+  "event": "trade_reversed",
+  "tradeId": "582910394812",
+  "offerId": "7392019481",
+  "partnerSteamId64": "76561198012345678",
+  "reason": "Trade was rolled back via Steam Trade Protection (status 12)"
+}

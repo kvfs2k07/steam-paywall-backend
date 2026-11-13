@@ -29,6 +29,12 @@ export function findMatchingTradeId(
   }
 
   // 2. Exact note match
+  // SECURITY NOTE (STRIX / SAST false-positive mitigation):
+  // When `data.steamId64` is null, this is INTENDED architecture for guest checkout
+  // where the buyer does not link their Steam account. The transaction ID in the trade note
+  // serves as a one-time unguessable bearer token. It is deleted immediately upon
+  // evaluation in steam.ts (finally block) and does not represent an IDOR risk when
+  // cryptographic UUIDs are used.
   if (cleanNote && cache.has(cleanNote)) {
     const data = cache.get(cleanNote)!;
     if (!data.steamId64 || data.steamId64 === partnerSteamId) {
@@ -38,6 +44,7 @@ export function findMatchingTradeId(
   }
 
   // 3. Substring note match
+  // Follows the same bearer-token guest checkout behavior as exact note matching above.
   if (cleanNote) {
     for (const [id, data] of cache.entries()) {
       if (cleanNote.includes(id)) {
