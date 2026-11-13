@@ -1,15 +1,28 @@
 {
-  "name": "steam-pellix",
+  "name": "steam-paywall-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "description": "Steam trade-based paywall backend for the store CS2 skin payments",
+  "main": "dist/index.js",
+  "license": "Apache-2.0",
   "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "steam",
+    "tradebot",
+    "payments",
+    "cs2",
+    "store"
+  ],
+  "author": "kvfs2k07",
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -18,5 +31,19 @@
     "steam-user": "^5.3.0",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/node-fetch": "^2.6.11",
+    "@types/supertest": "^7.2.1",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "eslint": "^9.0.0",
+    "supertest": "^7.3.2",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
   }
 }
