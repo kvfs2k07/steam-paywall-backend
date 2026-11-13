@@ -1,6 +1,13 @@
 # API & Webhook Request Documentation & Examples
 
-This directory provides request and response schemas, payloads, and `curl` examples for integrating your store website with the Steam Tradebot.
+This directory provides complete end-to-end simulation workflows, request/response schemas, payloads, and `curl` examples for integrating your store website with the Steam Tradebot.
+
+## End-to-End Flow Simulations (Markdown)
+
+* [01-linked-account-flow.md](01-linked-account-flow.md) — Customer connects Steam via OpenID; automatic SteamID64 matching & acceptance.
+* [02-guest-checkout-flow.md](02-guest-checkout-flow.md) — Customer checks out as a guest without linking Steam; one-time UUID bearer token in trade note.
+* [03-underpaid-or-rejected-flow.md](03-underpaid-or-rejected-flow.md) — Customer sends low-value/junk items; webhook rejection and offer cancellation.
+* [04-trade-protection-rollback-flow.md](04-trade-protection-rollback-flow.md) — Customer exploits 7-day trade protection; automatic status 12 detection and reversal webhook.
 
 ---
 
