@@ -85,21 +85,35 @@ npm run test:watch      # Watch mode
 npm run test:coverage   # Coverage report
 ```
 
-## API
+## API & Integration
+
+Full payload samples, responses, and curl commands are available in [examples/README.md](examples/README.md).
 
 ### `POST /api/trade-request`
 
 Registers a pending trade request from the store.
 
-**Headers:** `Authorization: Bearer <SHARED_SECRET>`
+**Headers:**
+* `Authorization: Bearer <SHARED_SECRET>`
+* `Content-Type: application/json`
 
-**Body:**
+**Mode A — Linked Steam Account (Recommended):**
+When the buyer connected their Steam account on your store, pass their `steamId64`:
 ```json
 {
-  "id": "transaction-uuid",
+  "id": "e4b1a8d0-25c7-4b91-88fc-430b2ad01f41",
   "steamId64": "76561198012345678"
 }
 ```
+
+**Mode B — Guest / Unlinked Checkout (Bearer Token in Trade Note):**
+When the buyer does not want to connect their Steam account, omit `steamId64`:
+```json
+{
+  "id": "f8c2e9b1-73a4-4c12-98ad-15e76b4a3902"
+}
+```
+The buyer pastes this transaction ID into the Steam Trade Offer note. The bot matches the note and immediately evicts the token upon trade evaluation.
 
 **Response:**
 ```json
