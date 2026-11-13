@@ -1,0 +1,468 @@
+name: Strix AI Security Review
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'NVIDIA Build model (LiteLLM nvidia_nim format)'
+        required: false
+        default: 'nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b'
+        type: choice
+        options:
+          - nvidia_nim/nvidia/nemotron-3.5-super-vl-120b-a12b
+          - nvidia_nim/minimaxai/minimax-m3.1-flash
+          - nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+          - nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+          - nvidia_nim/openai/gpt-oss-20b
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-audit:
+    name: Strix Security Audit (NVIDIA Build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check NVIDIA_API_KEY Secret
+        id: check_key
+        env:
+          KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "has_key=false" >> $GITHUB_OUTPUT
+            echo "::warning title=Missing NVIDIA_API_KEY::NVIDIA_API_KEY secret is not configured in repository secrets. Go to Settings -> Secrets and variables -> Actions to add it."
+          else
+            echo "has_key=true" >> $GITHUB_OUTPUT
+            echo "NVIDIA_API_KEY secret detected successfully."
+          fi
+
+      - name: Test NVIDIA Build Endpoint
+        if: steps.check_key.outputs.has_key == 'true'
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          INPUT_MODEL: ${{ inputs.model }}
+        run: |
+          echo "Checking accessible models on NVIDIA Build..."
+          MODELS_CODE=$(curl -4 -sS --connect-timeout 10 --max-time 15 \
+            -o /tmp/nvidia_models.json \
+            -w "%{http_code}" \
+            "https://integrate.api.nvidia.com/v1/models" \
+            -H "Authorization: Bearer $NVIDIA_API_KEY" || true)
+          echo "GET /v1/models HTTP status: $MODELS_CODE"
+          if [ "$MODELS_CODE" = "200" ]; then
+            jq -r '.data[].id' /tmp/nvidia_models.json | grep -iE 'qwen|minimax|nemotron|gpt-oss|llama-3\.3|devstral|deepseek|glm' | head -n 40 || true
+          else
+            cat /tmp/nvidia_models.json 2>/dev/null || true
+          fi
+
+          if [ -n "$INPUT_MODEL" ]; then
+            CLEAN_INPUT="${INPUT_MODEL#nvidia_nim/}"
+            CLEAN_INPUT="${CLEAN_INPUT#openai/}"
+            CANDIDATES=("$CLEAN_INPUT")
+          else
+            CANDIDATES=(
+              "nvidia/nemotron-3.5-super-vl-120b-a12b"
+              "minimaxai/minimax-m3.1-flash"
+              "nvidia/nemotron-3-ultra-550b-a55b"
+              "nvidia/nemotron-3.5-lightning-30b-a3b"
+              "openai/gpt-oss-20b"
+            )
+          fi
+
+          SELECTED=""
+          for MODEL_ID in "${CANDIDATES[@]}"; do
+            rm -f /tmp/nvidia_smoke.json
+            echo "Smoke-testing NVIDIA Build model: $MODEL_ID"
+            PAYLOAD=$(jq -n --arg model "$MODEL_ID" '{
+              model: $model,
+              messages: [{role: "user", content: "Reply with OK"}],
+              max_tokens: 32,
+              temperature: 0
+            }')
+            HTTP_CODE=$(curl -4 -sS --connect-timeout 10 --max-time 25 \
+              -o /tmp/nvidia_smoke.json \
+              -w "%{http_code}" \
+              -X POST "https://integrate.api.nvidia.com/v1/chat/completions" \
+              -H "Authorization: Bearer $NVIDIA_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" || true)
+            echo " -> $MODEL_ID HTTP status: $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              SELECTED="nvidia_nim/$MODEL_ID"
+              echo "Selected working model: $SELECTED"
+              break
+            else
+              cat /tmp/nvidia_smoke.json 2>/dev/null || true
+              echo ""
+            fi
+          done
+
+          if [ -z "$SELECTED" ]; then
+            echo "::error::No tested NVIDIA Build model returned HTTP 200. Check Public API Endpoints permissions on build.nvidia.com for this account."
+            exit 1
+          fi
+          echo "RESOLVED_STRIX_LLM=$SELECTED" >> $GITHUB_ENV
+
+      - name: Install Strix
+        if: steps.check_key.outputs.has_key == 'true'
+        run: |
+          curl -sSL https://strix.ai/install | bash || pipx install strix-agent
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Run Strix Security Scan
+        id: run_strix
+        if: steps.check_key.outputs.has_key == 'true'
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_NIM_API_BASE: "https://integrate.api.nvidia.com/v1"
+          LLM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          LLM_API_BASE: "https://integrate.api.nvidia.com/v1"
+          STRIX_API_TYPE: "chat_completions"
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          LITELLM_DROP_PARAMS: "True"
+          STRIX_LLM: ${{ env.RESOLVED_STRIX_LLM }}
+          STRIX_REASONING_EFFORT: "low"
+          LITELLM_REQUEST_TIMEOUT: "180"
+          LLM_PREFLIGHT_TIMEOUT: "120"
+          LLM_TIMEOUT: "180"
+          STRIX_LLM_MAX_RETRIES: "3"
+        run: |
+          echo "Running Strix with STRIX_LLM=$STRIX_LLM"
+          HEARTBEAT_PID=""
+          cleanup_heartbeat() {
+            if [ -n "$HEARTBEAT_PID" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+              kill "$HEARTBEAT_PID" 2>/dev/null || true
+              wait "$HEARTBEAT_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_heartbeat EXIT
+
+          (
+            while true; do
+              sleep 60
+              RUN_DIR=$(ls -dt strix_runs/*/ 2>/dev/null | head -n 1 || true)
+              FILE_COUNT=0
+              VULN_COUNT=0
+              RUN_STATUS="unknown"
+              LATEST="none"
+              if [ -n "$RUN_DIR" ]; then
+                FILE_COUNT=$(find "$RUN_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+                VULN_COUNT=$(find "$RUN_DIR/vulnerabilities" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+                if [ -f "$RUN_DIR/run.json" ]; then
+                  RUN_STATUS=$(jq -r '.status // "running"' "$RUN_DIR/run.json" 2>/dev/null || echo "unreadable")
+                fi
+                LATEST=$(find "$RUN_DIR" -type f -printf '%T@ %p (%s bytes)\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || echo "none")
+              fi
+              CONTAINERS=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+              echo "[heartbeat $(date -u +%H:%M:%SZ)] status=$RUN_STATUS files=$FILE_COUNT vulns=$VULN_COUNT docker_containers=$CONTAINERS latest=$LATEST"
+            done
+          ) &
+          HEARTBEAT_PID=$!
+
+          set +e
+          timeout --signal=INT --kill-after=30s 35m strix -n --target ./ --scan-mode quick
+          EXIT_CODE=$?
+          set -e
+
+          cleanup_heartbeat
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          if [ "$EXIT_CODE" -eq 124 ] || [ "$EXIT_CODE" -eq 137 ]; then
+            echo "::warning::Strix reached the 35m step limit (exit code $EXIT_CODE). Preserving progress before failing."
+          fi
+
+      - name: Backup & Summarize Strix Progress
+        if: always() && steps.check_key.outputs.has_key == 'true'
+        run: |
+          {
+            echo "## Strix Scan Progress Backup"
+            echo "- Model: \`${RESOLVED_STRIX_LLM:-unknown}\`"
+            echo "- Step exit code: \`${{ steps.run_strix.outputs.exit_code || 'cancelled' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ! -d strix_runs ]; then
+            echo "No strix_runs directory created." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "=== strix_runs tree ==="
+          find strix_runs -maxdepth 4 -ls || true
+
+          RUN_DIR=$(ls -dt strix_runs/*/ 2>/dev/null | head -n 1 || true)
+          if [ -z "$RUN_DIR" ]; then
+            echo "strix_runs exists but contains no run directory." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -f "$RUN_DIR/run.json" ]; then
+            echo "=== run.json ==="
+            cat "$RUN_DIR/run.json"
+            {
+              echo ""
+              echo "### \`run.json\`"
+              echo '```json'
+              head -c 4000 "$RUN_DIR/run.json"
+              echo ""
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -d "$RUN_DIR/vulnerabilities" ]; then
+            echo "=== vulnerability markdown files ==="
+            ls -la "$RUN_DIR/vulnerabilities"
+          fi
+
+          if [ -f "$RUN_DIR/penetration_test_report.md" ]; then
+            echo "=== penetration_test_report.md (first 200 lines) ==="
+            head -n 200 "$RUN_DIR/penetration_test_report.md"
+            {
+              echo ""
+              echo "### Penetration Test Report"
+              head -c 12000 "$RUN_DIR/penetration_test_report.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Strix Run Backup
+        if: always() && steps.check_key.outputs.has_key == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: strix-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: strix_runs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Post Inline PR Review Comments
+        if: always() && steps.check_key.outputs.has_key == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            if (!fs.existsSync('strix_runs')) {
+              core.info('No strix_runs directory found; skipping PR comments.');
+              return;
+            }
+
+            const runDirs = fs.readdirSync('strix_runs', { withFileTypes: true })
+              .filter((d) => d.isDirectory())
+              .map((d) => {
+                const full = path.join('strix_runs', d.name);
+                return { full, mtime: fs.statSync(full).mtimeMs };
+              })
+              .sort((a, b) => b.mtime - a.mtime);
+
+            if (runDirs.length === 0) {
+              core.info('No run subdirectories inside strix_runs.');
+              return;
+            }
+
+            const runDir = runDirs[0].full;
+            const workspace = (process.env.GITHUB_WORKSPACE || process.cwd()).replace(/\\/g, '/').replace(/\/+$/, '');
+            const normalizePath = (p) => {
+              if (!p || typeof p !== 'string') return '';
+              let s = p.replace(/\\/g, '/').replace(/^file:\/\//, '');
+              if (s.startsWith(workspace + '/')) s = s.slice(workspace.length + 1);
+              s = s.replace(/^\/home\/runner\/work\/[^/]+\/[^/]+\//, '');
+              return s.replace(/^\.\//, '').replace(/^\/+/, '');
+            };
+
+            const findings = [];
+            const coverageChecks = [];
+            const seen = new Set();
+            const isCoverageEntry = (item) => {
+              const sev = String(item.severity || '').toUpperCase();
+              const title = String(item.title || '');
+              const body = String(item.body || '');
+              return sev === 'NONE' || sev === 'NOTE' || /^coverage\b/i.test(title) || /\bno issue identified\b/i.test(body);
+            };
+            const addEntry = (item) => {
+              const file = normalizePath(item.file);
+              const line = Number.isInteger(item.line) && item.line > 0 ? item.line : null;
+              const sev = String(item.severity || 'HIGH').toUpperCase();
+              const rawTitle = String(item.title || 'Security Finding').trim();
+              let rawBody = String(item.body || '').trim();
+              if (rawTitle && rawBody.toLowerCase().startsWith(rawTitle.toLowerCase())) {
+                rawBody = rawBody.slice(rawTitle.length).replace(/^[\s:—-]+/, '').trim();
+              }
+              const key = `${rawTitle}|${file}|${line || ''}`;
+              if (seen.has(key)) return;
+              seen.add(key);
+              const entry = { title: rawTitle, severity: sev, file, line, body: rawBody };
+              if (isCoverageEntry(entry)) {
+                coverageChecks.push(entry);
+              } else {
+                findings.push(entry);
+              }
+            };
+
+            const sarifPath = path.join(runDir, 'findings.sarif');
+            if (fs.existsSync(sarifPath)) {
+              try {
+                const sarif = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+                for (const run of sarif.runs || []) {
+                  const rules = new Map((run.tool?.driver?.rules || []).map((r) => [r.id, r]));
+                  for (const res of run.results || []) {
+                    const loc = res.locations?.[0]?.physicalLocation;
+                    const uri = loc?.artifactLocation?.uri || '';
+                    const line = loc?.region?.startLine || null;
+                    const rule = rules.get(res.ruleId);
+                    const sev = res.properties?.severity || res.level || 'warning';
+                    const title = rule?.shortDescription?.text || rule?.name || res.ruleId || 'Security Finding';
+                    const message = res.message?.text || '';
+                    addEntry({ title, severity: sev, file: uri, line, body: message });
+                  }
+                }
+              } catch (err) {
+                core.warning(`Failed to parse ${sarifPath}: ${err.message}`);
+              }
+            }
+
+            const vulnJsonPath = path.join(runDir, 'vulnerabilities.json');
+            if (fs.existsSync(vulnJsonPath)) {
+              try {
+                const raw = JSON.parse(fs.readFileSync(vulnJsonPath, 'utf8'));
+                const list = Array.isArray(raw) ? raw : (raw.vulnerabilities || raw.findings || []);
+                for (const v of list) {
+                  const locs = Array.isArray(v.code_locations) ? v.code_locations : [];
+                  const firstLoc = locs[0] || {};
+                  const file = v.file_path || v.code_file || firstLoc.file_path || firstLoc.file || firstLoc.path || '';
+                  const line = Number(v.line || firstLoc.line || firstLoc.start_line || 0) || null;
+                  const title = v.title || v.name || v.id || 'Security Vulnerability';
+                  const sev = String(v.severity || 'HIGH').toUpperCase();
+                  const parts = [];
+                  if (v.cwe) parts.push(`CWE: ${v.cwe}`);
+                  if (v.endpoint) parts.push(`Endpoint: ${v.method ? v.method + ' ' : ''}${v.endpoint}`);
+                  if (v.impact) parts.push(`Impact: ${v.impact}`);
+                  if (v.technical_analysis) parts.push(v.technical_analysis);
+                  const before = v.fix_before || v.code_before;
+                  const after = v.fix_after || v.code_after;
+                  if (before || after) {
+                    parts.push(`Suggested fix:\n\`\`\`diff\n${before ? '- ' + before + '\n' : ''}${after ? '+ ' + after : ''}\n\`\`\``);
+                  }
+                  addEntry({ title, severity: sev, file, line, body: parts.join('\n\n') });
+                }
+              } catch (err) {
+                core.warning(`Failed to parse ${vulnJsonPath}: ${err.message}`);
+              }
+            }
+
+            const prFiles = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100
+            });
+
+            const validDiffLines = new Map();
+            for (const f of prFiles) {
+              const lines = new Set();
+              if (f.patch) {
+                let newLine = 0;
+                for (const rawLine of f.patch.split('\n')) {
+                  const m = rawLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                  if (m) {
+                    newLine = parseInt(m[1], 10);
+                  } else if (rawLine.startsWith('+') || rawLine.startsWith(' ')) {
+                    lines.add(newLine);
+                    newLine += 1;
+                  }
+                }
+              }
+              validDiffLines.set(f.filename, lines);
+            }
+
+            const inlineComments = [];
+            const generalFindings = [];
+            for (const f of findings) {
+              const locLabel = f.file ? `${f.file}${f.line ? ':' + f.line : ''}` : 'general';
+              const md = `\`\`\`yaml\nseverity: "${f.severity}"\nfinding: "${f.title.replace(/"/g, '\\"')}"\nlocation: "${locLabel}"\n\`\`\`\n\n${f.body || ''}`.trim().slice(0, 6000);
+              const fileLines = f.file ? validDiffLines.get(f.file) : null;
+              if (fileLines && f.line && fileLines.has(f.line) && inlineComments.length < 40) {
+                inlineComments.push({ path: f.file, line: f.line, side: 'RIGHT', body: md });
+              } else {
+                const detail = (f.body || '').replace(/\r?\n+/g, ' ').slice(0, 400);
+                generalFindings.push(`- [${f.severity}] ${f.title} (${locLabel})${detail ? '\n  ' + detail : ''}`);
+              }
+            }
+
+            const reportPath = path.join(runDir, 'penetration_test_report.md');
+            const reportText = fs.existsSync(reportPath) ? fs.readFileSync(reportPath, 'utf8') : '';
+            const exitCode = '${{ steps.run_strix.outputs.exit_code }}' || 'cancelled';
+            const totalVulns = findings.length;
+
+            if (totalVulns === 0 && coverageChecks.length === 0 && !reportText) {
+              core.info('No findings, coverage entries, or penetration_test_report.md produced; skipping PR comment.');
+              return;
+            }
+
+            const alertType = totalVulns > 0 ? 'CAUTION' : (exitCode === '0' ? 'TIP' : 'WARNING');
+            const statusText = totalVulns > 0
+              ? `VULNERABILITIES DETECTED (${totalVulns})`
+              : (exitCode === '0' ? 'PASS (0 exploitable vulnerabilities)' : `INCOMPLETE (exit_code=${exitCode})`);
+
+            let reviewBody = `## Strix AI Security Review\n\n> [!${alertType}]\n> **${statusText}**\n\n`;
+            reviewBody += `\`\`\`yaml\nmodel: "${process.env.RESOLVED_STRIX_LLM || 'unknown'}"\nstatus: "${statusText}"\nexit_code: "${exitCode}"\nvulnerabilities_total: ${totalVulns}\ninline_annotations: ${inlineComments.length}\noutside_diff_findings: ${generalFindings.length}\ncoverage_checks_passed: ${coverageChecks.length}\n\`\`\`\n`;
+
+            if (generalFindings.length > 0) {
+              reviewBody += `\n### Vulnerabilities Outside PR Diff Hunks\n\`\`\`diff\n@@ ${generalFindings.length} finding(s) require attention @@\n${generalFindings.join('\n')}\n\`\`\`\n`;
+            }
+
+            if (coverageChecks.length > 0) {
+              const coverageDiff = coverageChecks.map((c, idx) => {
+                const label = c.title.replace(/^coverage:\s*/i, '');
+                const detail = (c.body || '').replace(/\r?\n+/g, ' ').slice(0, 350);
+                return `+ [${idx + 1}] ${label}${detail ? '\n  ' + detail : ''}`;
+              }).join('\n');
+              reviewBody += `\n<details><summary>Coverage checks passed (${coverageChecks.length})</summary>\n\n\`\`\`diff\n@@ ${coverageChecks.length} surface(s) verified clean @@\n${coverageDiff}\n\`\`\`\n\n</details>\n`;
+            }
+
+            if (reportText) {
+              reviewBody += `\n<details><summary>Penetration Test Report</summary>\n\n${reportText.slice(0, 15000)}\n\n</details>\n`;
+            }
+            reviewBody = reviewBody.slice(0, 60000);
+
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                commit_id: context.payload.pull_request.head.sha,
+                event: 'COMMENT',
+                body: reviewBody,
+                comments: inlineComments
+              });
+            } catch (err) {
+              core.warning(`pulls.createReview failed (${err.message}); falling back to issue comment.`);
+              const fallback = inlineComments.map((c) => `- \`${c.path}:${c.line}\`\n${c.body}`).join('\n\n');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `${reviewBody}\n${fallback}`.slice(0, 60000)
+              });
+            }
+
+      - name: Enforce Strix Scan Result
+        if: always() && steps.check_key.outputs.has_key == 'true'
+        run: |
+          EXIT_CODE="${{ steps.run_strix.outputs.exit_code }}"
+          if [ -z "$EXIT_CODE" ]; then
+            echo "::error::Strix scan did not complete cleanly (job interrupted/cancelled)."
+            exit 1
+          fi
+          exit "$EXIT_CODE"

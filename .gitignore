@@ -1,0 +1,15 @@
+# Environment
+.env
+
+# Logs
+logs/
+*.log
+
+# Node
+node_modules/
+
+# Trade state
+tracked_trades.json
+
+# Editor / IDE
+.vscode/
